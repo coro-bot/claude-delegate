@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 
 param(
-    [Parameter(Mandatory = $true)]
+    [Parameter(Mandatory = $false)]
     [string]$Prompt,
 
     [string]$Cwd = ".",
@@ -37,6 +37,8 @@ param(
     [switch]$Bare,
 
     [int]$TimeoutSec = 300,
+
+    [switch]$Check,
 
     [switch]$Help
 )
@@ -82,6 +84,57 @@ function Exit-WithJson {
     )
     ConvertTo-BridgeJson $Value
     exit $Code
+}
+
+function Limit-Text {
+    param(
+        [string]$Text,
+        [int]$MaxChars = 8192
+    )
+    if (-not $Text -or $Text.Length -le $MaxChars) {
+        return $Text
+    }
+    $omitted = $Text.Length - $MaxChars
+    return "[truncated $omitted chars]`n" + $Text.Substring($Text.Length - $MaxChars)
+}
+
+function Get-ClaudeLaunch {
+    $commands = @(Get-Command claude -All -ErrorAction SilentlyContinue)
+    if ($commands.Count -eq 0) {
+        return $null
+    }
+
+    $preferred = @()
+    $preferred += @($commands | Where-Object { $_.Source -match '\.exe$' })
+    $preferred += @($commands | Where-Object { $_.Source -match '\.(cmd|bat)$' })
+    $preferred += @($commands | Where-Object { $_.Source -match '\.ps1$' })
+    $preferred += @($commands)
+
+    $command = $preferred | Where-Object { $_ } | Select-Object -First 1
+    $source = $command.Source
+
+    if ($source -match '\.ps1$') {
+        return @{
+            FileName = "pwsh"
+            PrefixArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $source)
+            Source = $source
+        }
+    }
+
+    if ($source -match '\.(cmd|bat)$') {
+        $comspec = if ($env:ComSpec) { $env:ComSpec } else { "cmd.exe" }
+        return @{
+            FileName = $comspec
+            PrefixArgs = @("/d", "/s", "/c", "`"$source`"")
+            Source = $source
+        }
+    }
+
+    return @{
+        FileName = $source
+        PrefixArgs = @()
+        Source = $source
+    }
 }
 
 function Has-Prop {
@@ -140,11 +193,35 @@ if ($TimeoutSec -lt 1) {
     } 2
 }
 
+if (-not $Check -and -not $Prompt) {
+    Exit-WithJson @{
+        success = $false
+        error = "Prompt is required unless -Check is specified."
+    } 2
+}
+
 if ($SessionId -and $Continue) {
     Exit-WithJson @{
         success = $false
         error = "Use either -SessionId or -Continue, not both."
     } 2
+}
+
+if ($JsonSchema -and $OutputFormat -eq "text") {
+    Exit-WithJson @{
+        success = $false
+        error = "-JsonSchema requires -OutputFormat json or -OutputFormat stream-json."
+    } 2
+}
+
+if ($MaxBudgetUsd) {
+    $budgetValue = 0.0
+    if (-not [double]::TryParse($MaxBudgetUsd, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$budgetValue) -or $budgetValue -le 0) {
+        Exit-WithJson @{
+            success = $false
+            error = "-MaxBudgetUsd must be a positive invariant-culture number, such as 0.50."
+        } 2
+    }
 }
 
 if (-not $AllowWrites -and $PermissionMode -eq "bypassPermissions") {
@@ -154,12 +231,85 @@ if (-not $AllowWrites -and $PermissionMode -eq "bypassPermissions") {
     } 2
 }
 
-$claude = Get-Command claude -ErrorAction SilentlyContinue
-if (-not $claude) {
+$writeToolNames = @("write", "edit", "notebookedit", "bash")
+if (-not $AllowWrites) {
+    $requestedTools = @()
+    if ($Tools) {
+        $requestedTools += ($Tools -split '[,\s]+' | Where-Object { $_ })
+    }
+    foreach ($toolEntry in $AllowedTools) {
+        if ($toolEntry) {
+            $requestedTools += ($toolEntry -split '[,\s]+' | Where-Object { $_ })
+        }
+    }
+
+    foreach ($requestedTool in $requestedTools) {
+        $toolName = ([string]$requestedTool).Trim()
+        foreach ($writeToolName in $writeToolNames) {
+            if ($toolName.ToLowerInvariant().StartsWith($writeToolName)) {
+                Exit-WithJson @{
+                    success = $false
+                    error = "Refusing tool '$toolName' without -AllowWrites."
+                } 2
+            }
+        }
+    }
+}
+
+$claudeLaunch = Get-ClaudeLaunch
+if (-not $claudeLaunch) {
     Exit-WithJson @{
         success = $false
         error = "The 'claude' command is not available on PATH."
     } 127
+}
+
+if ($Check) {
+    $versionPsi = [System.Diagnostics.ProcessStartInfo]::new()
+    $versionPsi.FileName = $claudeLaunch.FileName
+    $versionPsi.UseShellExecute = $false
+    $versionPsi.RedirectStandardOutput = $true
+    $versionPsi.RedirectStandardError = $true
+    $versionPsi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $versionPsi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+    foreach ($arg in $claudeLaunch.PrefixArgs) {
+        [void]$versionPsi.ArgumentList.Add($arg)
+    }
+    [void]$versionPsi.ArgumentList.Add("--version")
+
+    $versionProcess = [System.Diagnostics.Process]::new()
+    $versionProcess.StartInfo = $versionPsi
+    try {
+        [void]$versionProcess.Start()
+        $versionStdoutTask = $versionProcess.StandardOutput.ReadToEndAsync()
+        $versionStderrTask = $versionProcess.StandardError.ReadToEndAsync()
+        if (-not $versionProcess.WaitForExit([Math]::Min($TimeoutSec * 1000, 30000))) {
+            $versionProcess.Kill($true)
+            $versionProcess.WaitForExit(5000) | Out-Null
+        }
+        $versionStdout = $versionStdoutTask.GetAwaiter().GetResult()
+        $versionStderr = $versionStderrTask.GetAwaiter().GetResult()
+        $checkExitCode = if ($versionProcess.ExitCode -eq 0) { 0 } else { $versionProcess.ExitCode }
+        Exit-WithJson @{
+            success = ($versionProcess.ExitCode -eq 0)
+            pwsh_version = $PSVersionTable.PSVersion.ToString()
+            claude_path = $claudeLaunch.Source
+            claude_version = $versionStdout.Trim()
+            stderr = (Limit-Text $versionStderr.Trim())
+            exit_code = $versionProcess.ExitCode
+        } $checkExitCode
+    }
+    catch {
+        Exit-WithJson @{
+            success = $false
+            pwsh_version = $PSVersionTable.PSVersion.ToString()
+            claude_path = $claudeLaunch.Source
+            error = "Failed to run Claude Code version check: $($_.Exception.Message)"
+        } 1
+    }
+    finally {
+        $versionProcess.Dispose()
+    }
 }
 
 $resolvedCwd = Resolve-Path -LiteralPath $Cwd -ErrorAction SilentlyContinue
@@ -174,9 +324,7 @@ if (-not $AllowWrites) {
     if (-not $Tools -and $AllowedTools.Count -eq 0) {
         $Tools = "Read"
     }
-    if ($DisallowedTools.Count -eq 0) {
-        $DisallowedTools = @("Write,Edit,NotebookEdit,Bash")
-    }
+    $DisallowedTools = @($DisallowedTools + @("Write", "Edit", "NotebookEdit", "Bash") | Select-Object -Unique)
     if (-not $PermissionMode) {
         $PermissionMode = "default"
     }
@@ -239,7 +387,7 @@ if ($PermissionMode) {
 }
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
-$psi.FileName = $claude.Source
+$psi.FileName = $claudeLaunch.FileName
 $psi.WorkingDirectory = $resolvedCwd.Path
 $psi.UseShellExecute = $false
 $psi.RedirectStandardInput = $true
@@ -248,6 +396,9 @@ $psi.RedirectStandardError = $true
 $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
 $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+foreach ($arg in $claudeLaunch.PrefixArgs) {
+    [void]$psi.ArgumentList.Add($arg)
+}
 foreach ($arg in $argsList) {
     [void]$psi.ArgumentList.Add($arg)
 }
@@ -271,8 +422,11 @@ catch {
 
 $stdoutTask = $process.StandardOutput.ReadToEndAsync()
 $stderrTask = $process.StandardError.ReadToEndAsync()
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$timeoutMs = $TimeoutSec * 1000
 $inputTask = $process.StandardInput.WriteAsync($Prompt)
-if (-not $inputTask.Wait($TimeoutSec * 1000)) {
+$remainingMs = [Math]::Max(1, $timeoutMs - [int]$stopwatch.ElapsedMilliseconds)
+if (-not $inputTask.Wait($remainingMs)) {
     try {
         $process.Kill($true)
     }
@@ -283,7 +437,7 @@ if (-not $inputTask.Wait($TimeoutSec * 1000)) {
         catch {
         }
     }
-    $process.WaitForExit()
+    $process.WaitForExit(5000) | Out-Null
     $stdout = $stdoutTask.GetAwaiter().GetResult()
     $stderr = $stderrTask.GetAwaiter().GetResult()
     $process.Dispose()
@@ -292,9 +446,9 @@ if (-not $inputTask.Wait($TimeoutSec * 1000)) {
         exit_code = 124
         session_id = $null
         agent_messages = ""
-        stderr = $stderr.Trim()
+        stderr = (Limit-Text $stderr.Trim())
         error = "Claude Code timed out while receiving the prompt after $TimeoutSec seconds."
-        raw = $stdout
+        raw = (Limit-Text $stdout)
     } 124
 }
 $inputError = $null
@@ -311,7 +465,8 @@ catch {
 }
 $waitTask = $process.WaitForExitAsync()
 
-if (-not $waitTask.Wait($TimeoutSec * 1000)) {
+$remainingMs = [Math]::Max(1, $timeoutMs - [int]$stopwatch.ElapsedMilliseconds)
+if (-not $waitTask.Wait($remainingMs)) {
     try {
         $process.Kill($true)
     }
@@ -322,7 +477,7 @@ if (-not $waitTask.Wait($TimeoutSec * 1000)) {
         catch {
         }
     }
-    $process.WaitForExit()
+    $process.WaitForExit(5000) | Out-Null
     $stdout = $stdoutTask.GetAwaiter().GetResult()
     $stderr = $stderrTask.GetAwaiter().GetResult()
     $process.Dispose()
@@ -331,9 +486,9 @@ if (-not $waitTask.Wait($TimeoutSec * 1000)) {
         exit_code = 124
         session_id = $null
         agent_messages = ""
-        stderr = $stderr.Trim()
+        stderr = (Limit-Text $stderr.Trim())
         error = "Claude Code timed out after $TimeoutSec seconds."
-        raw = $stdout
+        raw = (Limit-Text $stdout)
     } 124
 }
 
@@ -450,7 +605,7 @@ $result = @{
 }
 
 if ($stderr.Trim()) {
-    $result.stderr = $stderr.Trim()
+    $result.stderr = Limit-Text $stderr.Trim()
 }
 
 if ($null -ne $structuredOutput) {
@@ -466,13 +621,17 @@ if (-not $success) {
         $errorParts += "Claude Code reported an error result."
     }
     if ($exitCode -ne 0) {
+        $unsupportedFlagMatch = [regex]::Match($stderr, '(?i)(unknown|unrecognized|invalid).{0,80}(--[A-Za-z0-9][A-Za-z0-9-]*)')
+        if ($unsupportedFlagMatch.Success) {
+            $errorParts += "Installed Claude Code CLI may not support '$($unsupportedFlagMatch.Groups[2].Value)'; upgrade Claude Code or omit the corresponding bridge parameter."
+        }
         $errorParts += "Claude Code exited with status $exitCode."
     }
     if ($inputError) {
         $errorParts += "Failed to write prompt to Claude Code stdin: $inputError"
     }
     $result.error = ($errorParts -join [Environment]::NewLine).Trim()
-    $result.raw = $stdout
+    $result.raw = Limit-Text $stdout
 }
 
 ConvertTo-BridgeJson $result
