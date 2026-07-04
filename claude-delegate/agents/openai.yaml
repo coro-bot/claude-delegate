@@ -1,0 +1,4 @@
+interface:
+  display_name: "Claude Delegate"
+  short_description: "Delegate bounded tasks to Claude Code"
+  default_prompt: "Use $claude-delegate to ask Claude Code for an independent review of this change."
